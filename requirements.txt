@@ -1,3 +1,4 @@
 pyTelegramBotAPI
 beautifulsoup4
 playwright
+playwright-stealth
