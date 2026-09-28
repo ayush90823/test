@@ -31,28 +31,39 @@ def extract_gdflix_page(target_url):
 
         try:
             page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
-            time.sleep(4)
+            time.sleep(3)
 
+            # Turnstile Captcha Precision Solver
             content_lower = page.content().lower()
-
-            # Cloudflare Turnstile Bypass Logic
-            if "turnstile" in content_lower or "verify you're human" in content_lower:
+            if "turnstile" in content_lower or "verify you're human" in content_lower or "challenges.cloudflare.com" in content_lower:
                 try:
-                    for f in page.frames:
-                        if "challenges.cloudflare.com" in f.url:
-                            f.click('body', timeout=5000)
-                            time.sleep(5)
-                            break
+                    # Iframe Element Target Karna
+                    cf_iframe = page.locator('iframe[src*="challenges.cloudflare.com"]').first
+                    if cf_iframe.is_visible():
+                        box = cf_iframe.bounding_box()
+                        if box:
+                            # Exact Checkbox Coordinate Par Click (Iframe Center-Left)
+                            click_x = box['x'] + 30
+                            click_y = box['y'] + box['height'] / 2
+                            page.mouse.click(click_x, click_y)
+                            time.sleep(6)
                 except Exception:
                     pass
 
+                # 'Continue' Button Click (If Present)
                 try:
                     continue_btn = page.locator('button:has-text("Continue"), input[value="Continue"], a:has-text("Continue")')
                     if continue_btn.is_visible():
                         continue_btn.click()
-                        time.sleep(5)
+                        time.sleep(4)
                 except Exception:
                     pass
+
+            # Wait explicitly for '.server-btn' or '.server-list' to appear
+            try:
+                page.wait_for_selector('.server-btn, .server-list, a[data-label]', timeout=15000)
+            except Exception:
+                pass  # Agar timeout ho, fir bhi content check kar lo
 
             final_html = page.content()
             browser.close()
@@ -69,7 +80,7 @@ def send_welcome(message):
 @bot.message_handler(func=lambda message: message.text.startswith(('http://', 'https://')))
 def process_url(message):
     url = message.text.strip()
-    status_msg = bot.reply_to(message, "⚙️ Page parse ho raha hai & links extract ho rahe hain...")
+    status_msg = bot.reply_to(message, "⚙️ Playwright precision clicker running...")
 
     html, error = extract_gdflix_page(url)
 
@@ -80,7 +91,7 @@ def process_url(message):
     soup = BeautifulSoup(html, 'html.parser')
     extracted_links = []
 
-    # Target class: 'server-btn' or 'server-list'
+    # 1. Target exact '<a class="server-btn">'
     server_buttons = soup.find_all('a', class_=re.compile(r'server-btn|server-link'))
 
     if server_buttons:
@@ -93,12 +104,12 @@ def process_url(message):
             label = btn.get('data-label', '').strip()
             server_name_elem = btn.find('span', class_='server-name')
             
-            if server_name_elem:
-                server_name = server_name_elem.contents[0].strip() if server_name_elem.contents else label
+            if server_name_elem and server_name_elem.contents:
+                server_name = server_name_elem.contents[0].strip()
             else:
                 server_name = label or "Server"
 
-            # Quality & Size Extraction (e.g., 480p x264 • 103.13 MB)
+            # Quality & Size Extraction
             meta_elem = btn.find('span', class_='server-meta')
             meta_info = ""
             if meta_elem:
@@ -110,20 +121,21 @@ def process_url(message):
             button_title = f"{server_name}{meta_info}"
             extracted_links.append((button_title, href))
 
-    # Fallback agar 'server-btn' class na mile toh general links search karein
+    # 2. Fallback: Search for any GDFlix / Gdshare / Drive links directly
     if not extracted_links:
         for a in soup.find_all('a', href=True):
             href = a['href']
             text = a.text.strip() or "Download Link"
             if any(x in href.lower() or x in text.lower() for x in ['gdflix', 'gdshare', 'gdrive', 'drive']):
-                extracted_links.append((text, href))
+                if (text, href) not in extracted_links:
+                    extracted_links.append((text, href))
 
     bot.delete_message(message.chat.id, status_msg.message_id)
 
     if extracted_links:
         markup = InlineKeyboardMarkup()
         for b_title, b_url in extracted_links:
-            clean_title = b_title[:35] if len(b_title) > 35 else b_title
+            clean_title = b_title[:38] if len(b_title) > 38 else b_title
             markup.add(InlineKeyboardButton(text=f"⚡ {clean_title}", url=b_url))
 
         bot.send_message(
@@ -133,11 +145,17 @@ def process_url(message):
             parse_mode="Markdown"
         )
     else:
+        # Detailed check if Turnstile was still present
+        if "turnstile" in html.lower() or "challenges.cloudflare.com" in html:
+            err_msg = "⚠️ Cloudflare Turnstile Captcha click miss ho gaya. GitHub Actions IP range ko website tight-block kar rahi hai."
+        else:
+            err_msg = "⚠️ Page load hua lekin server buttons render nahi hue."
+
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton(text="🔗 Open Page Directly", url=url))
         bot.send_message(
             message.chat.id,
-            "⚠️ Webpage par `server-btn` links match nahi ho sake. Page ko browser mein kholein:",
+            f"{err_msg}\nDirect page kholein:",
             reply_markup=markup
         )
 
