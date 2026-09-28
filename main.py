@@ -1,500 +1,317 @@
 import os
 import re
-import html
+import logging
+from urllib.parse import urljoin
+
 import requests
 from bs4 import BeautifulSoup
-
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
-    CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    CommandHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
-
-# =========================================================
-# SETTINGS
-# =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is missing.")
 
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/140.0.0.0 Safari/537.36"
+        "Chrome/131.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;"
+        "q=0.9,image/avif,image/webp,*/*;q=0.8"
+    ),
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-TIMEOUT = 20
+
+def fetch_page(url: str, timeout: int = 25):
+    """Fetch a page without attempting to bypass Cloudflare/CAPTCHA."""
+    response = requests.get(
+        url,
+        headers=HEADERS,
+        timeout=timeout,
+        allow_redirects=True,
+    )
+    return response
 
 
-# =========================================================
-# HTTP
-# =========================================================
+def is_cloudflare_challenge(response) -> bool:
+    """
+    Detect an actual Cloudflare/challenge page.
 
-def fetch_page(url):
-    try:
-        response = requests.get(
-            url,
-            headers=HEADERS,
-            timeout=TIMEOUT,
-            allow_redirects=True,
-        )
-
-        return response
-
-    except requests.RequestException as e:
-        print("REQUEST ERROR:", e)
-        return None
-
-
-# =========================================================
-# CLOUDFLARE DETECTION
-# =========================================================
-
-def is_cloudflare_page(response):
-    if response is None:
-        return False
-
+    Normal Cloudflare scripts such as Rocket Loader and Insights are NOT
+    treated as a challenge.
+    """
     text = response.text.lower()
+    final_url = response.url.lower()
 
-    # Strong indicators only.
-    strong_indicators = [
+    strong_markers = [
         "cf-chl-challenge",
         "challenge-platform",
+        "cf-chl-widget",
+        "turnstile-challenge",
         "just a moment...",
         "verify you are human",
         "checking your browser",
         "/cdn-cgi/challenge-platform/",
     ]
 
-    for indicator in strong_indicators:
-        if indicator in text:
-            return True
+    if any(marker in text or marker in final_url for marker in strong_markers):
+        return True
 
-    # HTTP 403/503 + Cloudflare markers
     if response.status_code in (403, 503):
-        if "cloudflare" in text or "cf-ray" in response.headers:
+        headers = {k.lower(): v.lower() for k, v in response.headers.items()}
+        if "cf-ray" in headers or "cf-mitigated" in headers:
             return True
 
     return False
 
 
-# =========================================================
-# TITLE
-# =========================================================
+def extract_season(page_url: str, title: str) -> str:
+    source = f"{page_url} {title}"
 
-def get_title(soup):
-    title = soup.title
+    match = re.search(r"season[\s\-_]*(\d+)", source, re.IGNORECASE)
+    if match:
+        return f"Season {match.group(1)}"
 
-    if title:
-        text = title.get_text(" ", strip=True)
+    match = re.search(r"\bs(\d+)\b", source, re.IGNORECASE)
+    if match:
+        return f"Season {match.group(1)}"
 
-        if text:
-            return text
+    return "Season"
+
+
+def episode_number(text: str) -> int:
+    match = re.search(r"(\d+)", text or "")
+    return int(match.group(1)) if match else 999999
+
+
+def parse_anime_page(page_url: str, html: str):
+    soup = BeautifulSoup(html, "lxml")
+
+    # This is only a promotional popup. It is not needed for parsing.
+    popup = soup.select_one("#tg-popup-root")
+    if popup:
+        popup.decompose()
+
+    title = ""
+    if soup.title:
+        title = soup.title.get_text(" ", strip=True)
 
     h1 = soup.find("h1")
+    if h1 and h1.get_text(strip=True):
+        title = h1.get_text(" ", strip=True)
 
-    if h1:
-        return h1.get_text(" ", strip=True)
-
-    return "Anime"
-
-
-# =========================================================
-# SEASON DETECTION
-# =========================================================
-
-def detect_season(text):
-    if not text:
-        return 1
-
-    patterns = [
-        r"\bseason[\s\-]*(\d+)\b",
-        r"\bs(\d+)\b",
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-
-        if match:
-            try:
-                return int(match.group(1))
-            except ValueError:
-                pass
-
-    return 1
-
-
-# =========================================================
-# EPISODE DETECTION
-# =========================================================
-
-def detect_episode(text):
-    if not text:
-        return None
-
-    patterns = [
-        r"\bepisode[\s\-]*(\d+)\b",
-        r"\bep[\s\-]*(\d+)\b",
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-
-        if match:
-            try:
-                return int(match.group(1))
-            except ValueError:
-                pass
-
-    return None
-
-
-# =========================================================
-# MAIN ANIME PAGE PARSER
-# IMPORTANT:
-# This function DOES NOT open download1.php
-# =========================================================
-
-def parse_anime_page(page_url, page_html):
-
-    soup = BeautifulSoup(page_html, "lxml")
-
-    title = get_title(soup)
-
-    # Detect season from page URL + title + page text
-    season_source = (
-        str(page_url)
-        + " "
-        + str(title)
-    )
-
-    season = detect_season(season_source)
+    season = extract_season(page_url, title)
 
     episodes = []
 
-    # Exact structure from the supplied source:
-    #
-    # <div class="episode">
-    #   <span class="episode-title">Episode 1</span>
-    #   ...
-    #   <a class="download-480p" href="...download1.php?...">
-    #
-    episode_blocks = soup.select("div.episode")
+    for block in soup.select("div.episode"):
+        title_el = block.select_one(".episode-title")
+        ep_title = title_el.get_text(" ", strip=True) if title_el else ""
 
-    print("EPISODE BLOCKS FOUND:", len(episode_blocks))
-
-    for block in episode_blocks:
-
-        title_element = block.select_one(".episode-title")
-
-        if not title_element:
+        if not ep_title:
             continue
 
-        episode_title = title_element.get_text(" ", strip=True)
+        download_links = []
+        watch_link = None
 
-        episode_number = detect_episode(episode_title)
-
-        if episode_number is None:
-            episode_number = detect_episode(
-                block.get_text(" ", strip=True)
-            )
-
-        if episode_number is None:
-            continue
-
-        downloads = []
-
-        # IMPORTANT:
-        # We only READ the href.
-        # We DO NOT request/open it here.
-        for link in block.select("a[href]"):
-
-            href = link.get("href", "").strip()
-
+        for a in block.select("a[href]"):
+            href = urljoin(page_url, a.get("href", "").strip())
             if not href:
                 continue
 
-            href = html.unescape(href)
+            if "download1.php" in href.lower():
+                if href not in download_links:
+                    download_links.append(href)
 
-            # Only save actual download1.php links
-            if "download1.php" in href:
+            if "playonline.php" in href.lower():
+                watch_link = href
 
-                quality = link.get_text(
-                    " ",
-                    strip=True
-                )
-
-                downloads.append({
-                    "quality": quality,
-                    "url": href,
-                })
-
-        # Optional watch-online URL
-        watch_link = None
-
-        watch_element = block.select_one(
-            "a.watch-online[href]"
-        )
-
-        if watch_element:
-            watch_link = html.unescape(
-                watch_element.get("href", "").strip()
+        if download_links:
+            episodes.append(
+                {
+                    "title": ep_title,
+                    "number": episode_number(ep_title),
+                    "download_links": download_links,
+                    "watch_link": watch_link,
+                }
             )
 
-        if downloads:
-
-            episodes.append({
-                "episode": episode_number,
-                "title": episode_title,
-                "downloads": downloads,
-                "watch": watch_link,
-            })
-
-    # Sort episodes
-    episodes.sort(
-        key=lambda x: x["episode"]
-    )
+    episodes.sort(key=lambda x: x["number"])
 
     return {
-        "title": title,
+        "title": title or "Anime",
         "season": season,
         "episodes": episodes,
+        "url": page_url,
     }
 
 
-# =========================================================
-# GDFlix EXTRACTION
-# =========================================================
+def find_gdflix_links(html: str, base_url: str):
+    soup = BeautifulSoup(html, "lxml")
+    found = []
 
-def find_gdflix_links(page_html):
-
-    soup = BeautifulSoup(page_html, "lxml")
-
-    results = []
-
-    # Exact server structure seen in the supplied source:
-    #
-    # <a class="server-btn"
-    #    href="https://new4.gdflix.io/file/..."
-    #    data-label="GDFlix">
-    #
-    for link in soup.select("a.server-btn[href]"):
-
-        href = html.unescape(
-            link.get("href", "").strip()
-        )
-
-        label = link.get(
-            "data-label",
-            ""
-        ).strip()
-
-        text = link.get_text(
-            " ",
-            strip=True
-        )
-
-        combined = (
-            label
+    # First check normal server buttons.
+    for a in soup.select("a.server-btn[href]"):
+        href = urljoin(base_url, a.get("href", "").strip())
+        label = (
+            a.get("data-label", "")
             + " "
-            + text
+            + a.get_text(" ", strip=True)
             + " "
             + href
         ).lower()
 
-        if "gdflix" in combined:
+        if "gdflix" in label and href not in found:
+            found.append(href)
 
-            if href not in results:
-                results.append(href)
+    # Fallback: search all links.
+    if not found:
+        for a in soup.select("a[href]"):
+            href = urljoin(base_url, a.get("href", "").strip())
+            label = (a.get_text(" ", strip=True) + " " + href).lower()
 
-    # Fallback:
-    # Search normal links if server-btn wasn't used.
-    if not results:
+            if "gdflix" in label and href not in found:
+                found.append(href)
 
-        for link in soup.select("a[href]"):
+    return found
 
-            href = html.unescape(
-                link.get("href", "").strip()
-            )
-
-            text = link.get_text(
-                " ",
-                strip=True
-            )
-
-            combined = (
-                text
-                + " "
-                + href
-            ).lower()
-
-            if "gdflix" in combined:
-
-                if href.startswith("http"):
-                    if href not in results:
-                        results.append(href)
-
-    return results
-
-
-# =========================================================
-# TELEGRAM /START
-# =========================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    message = (
-        "👋 Send me the main anime page URL.\n\n"
-        "Example:\n"
-        "https://hindianimeszone.com/..."
-    )
-
-    await update.message.reply_text(message)
-
-
-# =========================================================
-# HELP
-# =========================================================
-
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+    context.user_data.clear()
 
     await update.message.reply_text(
-        "Send the main anime page URL.\n\n"
-        "The bot will show Season and Episode buttons."
+        "Anime page ka URL bhejo.\n\n"
+        "Bot pehle sirf anime page parse karega.\n"
+        "Episode select karne ke baad hi us episode ke download pages check honge."
     )
 
 
-# =========================================================
-# RECEIVE MAIN ANIME URL
-# =========================================================
+async def receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = (update.message.text or "").strip()
 
-async def receive_url(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not update.message:
-        return
-
-    url = update.message.text.strip()
-
-    if not url.startswith(("http://", "https://")):
-
+    if not re.match(r"^https?://", url, re.IGNORECASE):
         await update.message.reply_text(
-            "❌ Please send a valid HTTP/HTTPS URL."
+            "⚠️ Valid http/https URL bhejo."
         )
-
         return
-
-    # IMPORTANT:
-    # Only main anime page is fetched here.
-    # NO download1.php is requested here.
 
     status = await update.message.reply_text(
-        "🔎 Reading anime page..."
+        "🔎 Anime page read kar raha hoon..."
     )
 
-    response = fetch_page(url)
+    try:
+        response = fetch_page(url)
 
-    if response is None:
-
-        await status.edit_text(
-            "❌ Could not open the page."
+        logger.info(
+            "Main page status=%s final_url=%s",
+            response.status_code,
+            response.url,
         )
 
-        return
-
-    if is_cloudflare_page(response):
-
-        await status.edit_text(
-            "⚠️ Cloudflare/CAPTCHA detected on the "
-            "main anime page.\n\n"
-            "Bot cannot bypass the verification."
-        )
-
-        return
-
-    data = parse_anime_page(
-        url,
-        response.text
-    )
-
-    if not data["episodes"]:
-
-        await status.edit_text(
-            "❌ No episode blocks were found.\n\n"
-            "The page structure may have changed."
-        )
-
-        return
-
-    # Store data for this Telegram user
-    context.user_data["anime"] = data
-    context.user_data["source_url"] = url
-
-    # Show season button
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                f"📺 Season {data['season']}",
-                callback_data=f"season:{data['season']}"
+        # IMPORTANT:
+        # Main page par normal Cloudflare Rocket Loader/Insights scripts
+        # ko challenge nahi maana ja raha. Sirf actual challenge page
+        # detect hone par stop karenge.
+        if is_cloudflare_challenge(response):
+            await status.edit_text(
+                "⚠️ Main anime page par Cloudflare/CAPTCHA challenge mila.\n\n"
+                "Bot protected challenge ko bypass nahi karta, isliye yahin ruk gaya."
             )
-        ]
-    ]
+            return
 
-    await status.edit_text(
-        f"🎬 {data['title']}\n\n"
-        "Select a season:",
-        reply_markup=InlineKeyboardMarkup(
-            keyboard
+        if response.status_code != 200:
+            await status.edit_text(
+                f"⚠️ Main page open nahi hua.\nHTTP status: {response.status_code}"
+            )
+            return
+
+        anime = parse_anime_page(url, response.text)
+
+        logger.info(
+            "Parsed title=%r season=%r episodes=%d",
+            anime["title"],
+            anime["season"],
+            len(anime["episodes"]),
         )
-    )
+
+        if not anime["episodes"]:
+            await status.edit_text(
+                "⚠️ Page mil gaya, lekin episode blocks nahi mile.\n\n"
+                "Expected format: div.episode + .episode-title + download1.php links."
+            )
+            return
+
+        context.user_data["anime"] = anime
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    anime["season"],
+                    callback_data="season:0",
+                )
+            ]
+        ]
+
+        await status.edit_text(
+            f"📺 {anime['title']}\n\n"
+            f"Season detected: {anime['season']}\n"
+            f"Episodes found: {len(anime['episodes'])}\n\n"
+            "Season select karo:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+    except requests.RequestException as e:
+        logger.exception("Main page request failed")
+        await status.edit_text(
+            f"❌ Main page request failed.\n{type(e).__name__}: {e}"
+        )
+    except Exception as e:
+        logger.exception("Unexpected error")
+        await status.edit_text(
+            f"❌ Error: {type(e).__name__}: {e}"
+        )
 
 
-# =========================================================
-# SHOW EPISODES
-# =========================================================
+async def show_season(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
-async def show_season(
-    query,
-    context
-):
+    anime = context.user_data.get("anime")
 
-    data = context.user_data.get("anime")
-
-    if not data:
+    if not anime:
         await query.edit_message_text(
-            "❌ Session expired. Send the anime URL again."
+            "⚠️ Session data nahi mila. /start karke dobara URL bhejo."
         )
         return
 
-    episodes = data["episodes"]
+    episodes = anime["episodes"]
 
     keyboard = []
-
     row = []
 
-    for item in episodes:
-
-        number = item["episode"]
-
+    for index, ep in enumerate(episodes):
         row.append(
             InlineKeyboardButton(
-                f"EP {number}",
-                callback_data=f"episode:{number}"
+                ep["title"],
+                callback_data=f"episode:{index}",
             )
         )
 
@@ -505,276 +322,164 @@ async def show_season(
     if row:
         keyboard.append(row)
 
-    keyboard.append([
-        InlineKeyboardButton(
-            "🏠 Home",
-            callback_data="home"
-        )
-    ])
+    keyboard.append(
+        [InlineKeyboardButton("⬅️ Back", callback_data="home")]
+    )
 
     await query.edit_message_text(
-        f"📺 Season {data['season']}\n\n"
-        "Select an episode:",
-        reply_markup=InlineKeyboardMarkup(
-            keyboard
-        )
+        f"📺 {anime['title']}\n"
+        f"📂 {anime['season']}\n\n"
+        "Episode select karo:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
-# =========================================================
-# PROCESS EPISODE
-# =========================================================
-
 async def process_episode(
-    query,
-    context,
-    episode_number
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    index: int,
 ):
+    query = update.callback_query
+    await query.answer()
 
-    data = context.user_data.get("anime")
+    anime = context.user_data.get("anime")
 
-    if not data:
+    if not anime:
         await query.edit_message_text(
-            "❌ Session expired. Send the anime URL again."
+            "⚠️ Session data nahi mila. /start karke dobara URL bhejo."
         )
         return
 
-    episode = None
+    episodes = anime["episodes"]
 
-    for item in data["episodes"]:
-
-        if item["episode"] == episode_number:
-            episode = item
-            break
-
-    if not episode:
-
-        await query.edit_message_text(
-            "❌ Episode not found."
-        )
-
+    if index < 0 or index >= len(episodes):
+        await query.edit_message_text("⚠️ Invalid episode.")
         return
+
+    ep = episodes[index]
 
     await query.edit_message_text(
-        f"⏳ Processing Episode {episode_number}...\n\n"
-        "Checking download pages..."
+        f"⏳ {ep['title']} ke download pages check kar raha hoon...\n\n"
+        "Quality buttons nahi dikhaye jayenge."
     )
 
     gdflix_links = []
 
-    # IMPORTANT:
-    # download1.php is opened ONLY NOW,
-    # after user clicked an episode.
-
-    for item in episode["downloads"]:
-
-        download_url = item["url"]
-
-        print(
-            "Opening download page:",
-            download_url
-        )
-
-        response = fetch_page(
-            download_url
-        )
-
-        if response is None:
-            continue
-
-        if is_cloudflare_page(response):
-
-            await query.edit_message_text(
-                "⚠️ Cloudflare/CAPTCHA detected.\n\n"
-                "The download page requires verification, "
-                "so the bot stopped here.\n\n"
-                f"Episode: {episode_number}\n"
-                f"Quality: {item['quality']}"
+    try:
+        # IMPORTANT:
+        # download1.php ko sirf episode button click ke baad request kiya jata hai.
+        for number, download_url in enumerate(ep["download_links"], start=1):
+            logger.info(
+                "Checking episode=%s download_link=%d",
+                ep["title"],
+                number,
             )
 
+            response = fetch_page(download_url)
+
+            logger.info(
+                "Download page status=%s final_url=%s",
+                response.status_code,
+                response.url,
+            )
+
+            if is_cloudflare_challenge(response):
+                await query.edit_message_text(
+                    "⚠️ Download page par Cloudflare/CAPTCHA challenge mila.\n\n"
+                    "Bot challenge ko bypass nahi karta, isliye yahin ruk gaya.\n\n"
+                    f"Stopped URL:\n{download_url}"
+                )
+                return
+
+            if response.status_code != 200:
+                continue
+
+            links = find_gdflix_links(response.text, response.url)
+
+            for link in links:
+                if link not in gdflix_links:
+                    gdflix_links.append(link)
+
+        if not gdflix_links:
+            await query.edit_message_text(
+                f"⚠️ {ep['title']} ke download pages check hue, "
+                "lekin GDFlix link nahi mila."
+            )
             return
 
-        found = find_gdflix_links(
-            response.text
+        buttons = []
+        for i, link in enumerate(gdflix_links, start=1):
+            buttons.append(
+                [InlineKeyboardButton(f"GDFlix Link {i}", url=link)]
+            )
+
+        buttons.append(
+            [InlineKeyboardButton("⬅️ Episodes", callback_data="season:0")]
         )
-
-        for link in found:
-
-            if link not in gdflix_links:
-                gdflix_links.append(link)
-
-    # =====================================================
-    # RESULT
-    # =====================================================
-
-    if not gdflix_links:
 
         await query.edit_message_text(
-            f"❌ No GDFlix link found for "
-            f"Episode {episode_number}."
+            f"✅ {ep['title']} ka GDFlix link mil gaya.\n\n"
+            "Neeche link open karo:",
+            reply_markup=InlineKeyboardMarkup(buttons),
         )
 
+    except requests.RequestException as e:
+        logger.exception("Download page request failed")
+        await query.edit_message_text(
+            f"❌ Download page request failed.\n"
+            f"{type(e).__name__}: {e}"
+        )
+    except Exception as e:
+        logger.exception("Unexpected episode error")
+        await query.edit_message_text(
+            f"❌ Error: {type(e).__name__}: {e}"
+        )
+
+
+async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data or ""
+
+    if data == "home":
+        await show_season(update, context)
         return
 
-    # We send GDFlix links directly.
-    # No quality-selection buttons.
+    if data.startswith("season:"):
+        await show_season(update, context)
+        return
 
-    keyboard = []
+    if data.startswith("episode:"):
+        try:
+            index = int(data.split(":", 1)[1])
+        except ValueError:
+            await query.answer("Invalid episode.", show_alert=True)
+            return
 
-    for index, link in enumerate(
-        gdflix_links,
-        start=1
-    ):
-
-        keyboard.append([
-            InlineKeyboardButton(
-                f"🔗 GDFlix {index}",
-                url=link
-            )
-        ])
-
-    keyboard.append([
-        InlineKeyboardButton(
-            "⬅️ Episodes",
-            callback_data=f"season:{data['season']}"
-        )
-    ])
-
-    await query.edit_message_text(
-        f"✅ Episode {episode_number}\n\n"
-        "GDFlix link found:",
-        reply_markup=InlineKeyboardMarkup(
-            keyboard
-        )
-    )
-
-
-# =========================================================
-# CALLBACK HANDLER
-# =========================================================
-
-async def callback(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
+        await process_episode(update, context, index)
+        return
 
     await query.answer()
 
-    data = query.data or ""
-
-    # HOME
-    if data == "home":
-
-        anime = context.user_data.get("anime")
-
-        if not anime:
-
-            await query.edit_message_text(
-                "Send the anime page URL again."
-            )
-
-            return
-
-        keyboard = [[
-            InlineKeyboardButton(
-                f"📺 Season {anime['season']}",
-                callback_data=f"season:{anime['season']}"
-            )
-        ]]
-
-        await query.edit_message_text(
-            f"🎬 {anime['title']}\n\n"
-            "Select a season:",
-            reply_markup=InlineKeyboardMarkup(
-                keyboard
-            )
-        )
-
-        return
-
-    # SEASON
-    if data.startswith("season:"):
-
-        await show_season(
-            query,
-            context
-        )
-
-        return
-
-    # EPISODE
-    if data.startswith("episode:"):
-
-        try:
-            episode_number = int(
-                data.split(":", 1)[1]
-            )
-
-        except ValueError:
-
-            await query.edit_message_text(
-                "❌ Invalid episode."
-            )
-
-            return
-
-        await process_episode(
-            query,
-            context,
-            episode_number
-        )
-
-        return
-
-
-# =========================================================
-# MAIN
-# =========================================================
 
 def main():
+    logger.info("Starting Telegram Bot...")
 
-    print("Starting Telegram bot...")
-
-    app = (
+    application = (
         Application.builder()
         .token(BOT_TOKEN)
         .build()
     )
 
-    app.add_handler(
-        CommandHandler(
-            "start",
-            start
-        )
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, receive_url)
+    )
+    application.add_handler(
+        CallbackQueryHandler(callback)
     )
 
-    app.add_handler(
-        CommandHandler(
-            "help",
-            help_command
-        )
-    )
-
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            receive_url
-        )
-    )
-
-    app.add_handler(
-        CallbackQueryHandler(
-            callback
-        )
-    )
-
-    print("Bot is running.")
-
-    app.run_polling(
-        drop_pending_updates=True
-    )
+    logger.info("Bot is running.")
+    application.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
