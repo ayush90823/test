@@ -1,17 +1,30 @@
 import os
 import re
-import requests
 from bs4 import BeautifulSoup
+import cloudscraper
 import telebot
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-# GitHub Secrets se token lega, agar nahi mila toh fallback default token use karega
+# Bot Token
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8647638574:AAFA688Xv_h85doU99zBWfBHmnb3N4MKqVw")
 bot = telebot.TeleBot(BOT_TOKEN)
 
+# Cloudscraper object banayein (Cloudflare protection bypass karne ke liye)
+scraper = cloudscraper.create_scraper(
+    browser={
+        'browser': 'chrome',
+        'platform': 'windows',
+        'desktop': True
+    }
+)
+
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    bot.reply_to(message, "👋 **Namaste!** Mujhe kisi bhi page ka URL bhejo, main uske episodes ke Season-wise Grid Buttons bana dunga.", parse_mode="Markdown")
+    bot.reply_to(
+        message,
+        "👋 **Namaste!** Mujhe kisi bhi page ka URL bhejo, main uske episodes ke Season-wise Grid Buttons bana dunga.",
+        parse_mode="Markdown"
+    )
 
 @bot.message_handler(func=lambda message: message.text.startswith(('http://', 'https://')))
 def process_url(message):
@@ -19,11 +32,15 @@ def process_url(message):
     status_msg = bot.reply_to(message, "🔍 Page extract kiya ja raha hai, kripya intezar karein...")
 
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        response = requests.get(url, headers=headers, timeout=10)
+        # Cloudscraper se request bhejein
+        response = scraper.get(url, timeout=15)
         
         if response.status_code != 200:
-            bot.edit_message_text("❌ Page load nahi ho saka. Invalid URL ya website block hai.", message.chat.id, status_msg.message_id)
+            bot.edit_message_text(
+                f"❌ Page load nahi ho saka. Status Code: {response.status_code}\nWebsite block kar rahi hai ya URL galat hai.",
+                message.chat.id,
+                status_msg.message_id
+            )
             return
 
         soup = BeautifulSoup(response.text, 'html.parser')
