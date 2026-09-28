@@ -18,6 +18,11 @@ scraper = cloudscraper.create_scraper(
     }
 )
 
+# Helper function: List ko fixed chunks (parts) mein todne ke liye
+def chunk_list(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     bot.reply_to(
@@ -29,7 +34,7 @@ def send_welcome(message):
 @bot.message_handler(func=lambda message: message.text.startswith(('http://', 'https://')))
 def process_url(message):
     url = message.text.strip()
-    status_msg = bot.reply_to(message, "🔍 Hindi Anime Zone page parse kiya ja raha hai...")
+    status_msg = bot.reply_to(message, "🔍 Page parse kiya ja raha hai, kripya intezar karein...")
 
     try:
         response = scraper.get(url, timeout=15)
@@ -47,32 +52,27 @@ def process_url(message):
         # WordPress Post Content Container Target Karna
         content = soup.find('div', class_=re.compile(r'entry-content|post-content|post-body|inside-article'))
         if not content:
-            content = soup  # Fallback agar div class na mile
+            content = soup
 
         seasons_data = {}
         current_section = "Episodes & Downloads"
 
-        # Content ke andar ke headings aur links analyze karna
         for element in content.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'p', 'div', 'a']):
-            # Agar Heading ya Section Bold text milta hai (Season/Quality Info)
             if element.name in ['h1', 'h2', 'h3', 'h4', 'h5']:
                 header_text = element.text.strip()
                 if header_text and len(header_text) < 60:
                     current_section = header_text
                     continue
 
-            # Agar link element hai
             if element.name == 'a' and element.get('href'):
                 text = element.text.strip()
                 href = element['href']
 
-                # Filter out unnecessary links (social media, home page, comments)
                 if not text or not href.startswith('http') or 'javascript' in href:
                     continue
                 if any(x in href.lower() for x in ['facebook.com', 'twitter.com', 'telegram.me', 't.me', 'whatsapp.com', 'category', 'tag', 'author']):
                     continue
 
-                # Episode, Download, Quality ya Drive link matching
                 if re.search(r'ep|episode|download|480p|720p|1080p|watch|gdrive|mega|drive|link|zip|batch|\b\d{1,3}\b', text, re.IGNORECASE):
                     if current_section not in seasons_data:
                         seasons_data[current_section] = []
@@ -92,36 +92,48 @@ def process_url(message):
         except Exception:
             pass
 
-        # Buttons Bhejna (Season-wise / Section-wise)
+        # Sections & Safe Chunking
+        # Ek message mein maximum 20 buttons (10 rows of 2) bheje jayenge
+        MAX_BUTTONS_PER_MSG = 20
+
         for section_title, ep_list in seasons_data.items():
             if not ep_list:
                 continue
 
-            markup = InlineKeyboardMarkup()
-            row = []
-            
-            for ep_title, ep_url in ep_list:
-                clean_title = ep_title.replace("\n", " ").strip()
-                if len(clean_title) > 25:
-                    clean_title = clean_title[:22] + "..."
-                
-                button = InlineKeyboardButton(text=f"📁 {clean_title}", url=ep_url)
-                row.append(button)
-                
-                # 2 Buttons per row (Grid Layout)
-                if len(row) == 2:
-                    markup.row(*row)
-                    row = []
-            
-            if row:
-                markup.row(*row)
+            # List ko chunks mein baantein
+            chunks = list(chunk_list(ep_list, MAX_BUTTONS_PER_MSG))
+            total_parts = len(chunks)
 
-            bot.send_message(
-                message.chat.id, 
-                f"🎬 **{section_title}**\nTotal Links: {len(ep_list)}", 
-                reply_markup=markup, 
-                parse_mode="Markdown"
-            )
+            for idx, chunk in enumerate(chunks, 1):
+                markup = InlineKeyboardMarkup()
+                row = []
+                
+                for ep_title, ep_url in chunk:
+                    clean_title = ep_title.replace("\n", " ").strip()
+                    if len(clean_title) > 22:
+                        clean_title = clean_title[:19] + "..."
+                    
+                    button = InlineKeyboardButton(text=f"📁 {clean_title}", url=ep_url)
+                    row.append(button)
+                    
+                    # 2 Buttons per row (Grid)
+                    if len(row) == 2:
+                        markup.row(*row)
+                        row = []
+                
+                if row:
+                    markup.row(*row)
+
+                # Header Title Format (e.g., Part 1/2 agar multiple messages hon)
+                part_text = f" (Part {idx}/{total_parts})" if total_parts > 1 else ""
+                msg_caption = f"🎬 **{section_title}**{part_text}\nTotal Links in this batch: {len(chunk)}"
+
+                bot.send_message(
+                    message.chat.id, 
+                    msg_caption, 
+                    reply_markup=markup, 
+                    parse_mode="Markdown"
+                )
 
     except Exception as e:
         error_text = f"⚠️ Error aaya: {str(e)}"
