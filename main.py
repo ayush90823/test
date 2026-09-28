@@ -54,9 +54,6 @@ def fetch_page(url: str, timeout: int = 25):
 def is_cloudflare_challenge(response) -> bool:
     """
     Detect an actual Cloudflare/challenge page.
-
-    Normal Cloudflare scripts such as Rocket Loader and Insights are NOT
-    treated as a challenge.
     """
     text = response.text.lower()
     final_url = response.url.lower()
@@ -105,7 +102,7 @@ def episode_number(text: str) -> int:
 def parse_anime_page(page_url: str, html: str):
     soup = BeautifulSoup(html, "lxml")
 
-    # This is only a promotional popup. It is not needed for parsing.
+    # Promotional popup remove karein
     popup = soup.select_one("#tg-popup-root")
     if popup:
         popup.decompose()
@@ -122,37 +119,72 @@ def parse_anime_page(page_url: str, html: str):
 
     episodes = []
 
-    for block in soup.select("div.episode"):
-        title_el = block.select_one(".episode-title")
-        ep_title = title_el.get_text(" ", strip=True) if title_el else ""
+    # 1. Pehle standard div.episode blocks check karein
+    episode_blocks = soup.select("div.episode")
+    
+    if episode_blocks:
+        for block in episode_blocks:
+            title_el = block.select_one(".episode-title")
+            ep_title = title_el.get_text(" ", strip=True) if title_el else ""
 
-        if not ep_title:
-            continue
-
-        download_links = []
-        watch_link = None
-
-        for a in block.select("a[href]"):
-            href = urljoin(page_url, a.get("href", "").strip())
-            if not href:
+            if not ep_title:
                 continue
 
-            if "download1.php" in href.lower():
-                if href not in download_links:
-                    download_links.append(href)
+            download_links = []
+            watch_link = None
 
-            if "playonline.php" in href.lower():
-                watch_link = href
+            for a in block.select("a[href]"):
+                href = urljoin(page_url, a.get("href", "").strip())
+                if not href:
+                    continue
 
-        if download_links:
-            episodes.append(
-                {
-                    "title": ep_title,
-                    "number": episode_number(ep_title),
-                    "download_links": download_links,
-                    "watch_link": watch_link,
-                }
-            )
+                if "download" in href.lower() or "gdflix" in href.lower() or "1.php" in href.lower():
+                    if href not in download_links:
+                        download_links.append(href)
+
+                if "play" in href.lower():
+                    watch_link = href
+
+            if download_links:
+                episodes.append(
+                    {
+                        "title": ep_title,
+                        "number": episode_number(ep_title),
+                        "download_links": download_links,
+                        "watch_link": watch_link,
+                    }
+                )
+
+    # 2. WordPress post content (.td-post-content) ke andar links scan karein agar div.episode na mile
+    if not episodes:
+        for a in soup.select(".td-post-content a[href]"):
+            href = urljoin(page_url, a.get("href", "").strip())
+            text = a.get_text(" ", strip=True)
+            
+            if href and (re.search(r"ep|episode|\d+", text, re.IGNORECASE) or "download" in href.lower() or "gdflix" in href.lower()):
+                if not any(ep['title'] == text for ep in episodes):
+                    episodes.append({
+                        "title": text or f"Episode {len(episodes)+1}",
+                        "number": episode_number(text),
+                        "download_links": [href],
+                        "watch_link": None
+                    })
+
+    # 3. Final Fallback: Agar specific episodes nahi mile, toh saare valid links extract kar lo
+    if not episodes:
+        general_links = []
+        for a in soup.select(".td-post-content a[href]"):
+            href = urljoin(page_url, a.get("href", "").strip())
+            if href and href not in general_links and ("gdflix" in href or "file" in href or "drive" in href or "download" in href):
+                general_links.append(href)
+        
+        if general_links:
+            episodes.append({
+                "title": title or "Full Pack / Episodes",
+                "number": 1,
+                "download_links": general_links,
+                "watch_link": None
+            })
 
     episodes.sort(key=lambda x: x["number"])
 
@@ -168,7 +200,6 @@ def find_gdflix_links(html: str, base_url: str):
     soup = BeautifulSoup(html, "lxml")
     found = []
 
-    # First check normal server buttons.
     for a in soup.select("a.server-btn[href]"):
         href = urljoin(base_url, a.get("href", "").strip())
         label = (
@@ -182,7 +213,6 @@ def find_gdflix_links(html: str, base_url: str):
         if "gdflix" in label and href not in found:
             found.append(href)
 
-    # Fallback: search all links.
     if not found:
         for a in soup.select("a[href]"):
             href = urljoin(base_url, a.get("href", "").strip())
@@ -226,10 +256,6 @@ async def receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response.url,
         )
 
-        # IMPORTANT:
-        # Main page par normal Cloudflare Rocket Loader/Insights scripts
-        # ko challenge nahi maana ja raha. Sirf actual challenge page
-        # detect hone par stop karenge.
         if is_cloudflare_challenge(response):
             await status.edit_text(
                 "⚠️ Main anime page par Cloudflare/CAPTCHA challenge mila.\n\n"
@@ -254,8 +280,7 @@ async def receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not anime["episodes"]:
             await status.edit_text(
-                "⚠️ Page mil gaya, lekin episode blocks nahi mile.\n\n"
-                "Expected format: div.episode + .episode-title + download1.php links."
+                "⚠️ Page mil gaya, lekin episode blocks ya links nahi mile."
             )
             return
 
@@ -310,12 +335,12 @@ async def show_season(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for index, ep in enumerate(episodes):
         row.append(
             InlineKeyboardButton(
-                ep["title"],
+                ep["title"][:30],
                 callback_data=f"episode:{index}",
             )
         )
 
-        if len(row) == 3:
+        if len(row) == 2:
             keyboard.append(row)
             row = []
 
@@ -359,15 +384,12 @@ async def process_episode(
     ep = episodes[index]
 
     await query.edit_message_text(
-        f"⏳ {ep['title']} ke download pages check kar raha hoon...\n\n"
-        "Quality buttons nahi dikhaye jayenge."
+        f"⏳ {ep['title']} ke download pages check kar raha hoon..."
     )
 
     gdflix_links = []
 
     try:
-        # IMPORTANT:
-        # download1.php ko sirf episode button click ke baad request kiya jata hai.
         for number, download_url in enumerate(ep["download_links"], start=1):
             logger.info(
                 "Checking episode=%s download_link=%d",
@@ -375,18 +397,16 @@ async def process_episode(
                 number,
             )
 
-            response = fetch_page(download_url)
+            if any(domain in download_url.lower() for domain in ["gdflix", "file", "drive"]):
+                if download_url not in gdflix_links:
+                    gdflix_links.append(download_url)
+                continue
 
-            logger.info(
-                "Download page status=%s final_url=%s",
-                response.status_code,
-                response.url,
-            )
+            response = fetch_page(download_url)
 
             if is_cloudflare_challenge(response):
                 await query.edit_message_text(
                     "⚠️ Download page par Cloudflare/CAPTCHA challenge mila.\n\n"
-                    "Bot challenge ko bypass nahi karta, isliye yahin ruk gaya.\n\n"
                     f"Stopped URL:\n{download_url}"
                 )
                 return
@@ -400,17 +420,19 @@ async def process_episode(
                 if link not in gdflix_links:
                     gdflix_links.append(link)
 
+        if not gdflix_links and ep["download_links"]:
+            gdflix_links = ep["download_links"]
+
         if not gdflix_links:
             await query.edit_message_text(
-                f"⚠️ {ep['title']} ke download pages check hue, "
-                "lekin GDFlix link nahi mila."
+                f"⚠️ {ep['title']} ke download pages check hue, lekin koi link nahi mila."
             )
             return
 
         buttons = []
         for i, link in enumerate(gdflix_links, start=1):
             buttons.append(
-                [InlineKeyboardButton(f"GDFlix Link {i}", url=link)]
+                [InlineKeyboardButton(f"Link {i}", url=link)]
             )
 
         buttons.append(
@@ -418,7 +440,7 @@ async def process_episode(
         )
 
         await query.edit_message_text(
-            f"✅ {ep['title']} ka GDFlix link mil gaya.\n\n"
+            f"✅ {ep['title']} ke links mil gaye.\n\n"
             "Neeche link open karo:",
             reply_markup=InlineKeyboardMarkup(buttons),
         )
@@ -426,8 +448,7 @@ async def process_episode(
     except requests.RequestException as e:
         logger.exception("Download page request failed")
         await query.edit_message_text(
-            f"❌ Download page request failed.\n"
-            f"{type(e).__name__}: {e}"
+            f"❌ Download page request failed.\n{type(e).__name__}: {e}"
         )
     except Exception as e:
         logger.exception("Unexpected episode error")
