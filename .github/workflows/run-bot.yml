@@ -1,0 +1,75 @@
+name: Run Stream Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"   # har 6 ghante me restart
+
+# Ek time par sirf ek instance (warna 2 bots same token par conflict karenge)
+concurrency:
+  group: stream-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # tunnel branch par naya URL push karne ke liye
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355   # 6 ghante ki limit se pehle band hoga
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install cloudflared
+        run: |
+          curl -L -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+
+      # Quick tunnel: account/card nahi chahiye, par URL har baar naya milta hai.
+      # Naya URL "tunnel" branch ki url.json me save hota hai, jise docs/index.html padhta hai.
+      - name: Start quick tunnel and publish URL
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          nohup cloudflared tunnel --no-autoupdate --url http://localhost:8080 > tunnel.log 2>&1 &
+
+          URL=""
+          for i in $(seq 1 30); do
+            URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' tunnel.log | head -n 1 || true)
+            [ -n "$URL" ] && break
+            sleep 2
+          done
+          if [ -z "$URL" ]; then
+            echo "Tunnel URL nahi mila"; cat tunnel.log; exit 1
+          fi
+          echo "Tunnel URL: $URL"
+
+          mkdir "$RUNNER_TEMP/tunnel" && cd "$RUNNER_TEMP/tunnel"
+          git init -q -b tunnel
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          echo "{\"url\": \"$URL\"}" > url.json
+          git add url.json
+          git commit -q -m "Update tunnel URL"
+          git push -q --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" tunnel
+
+      - name: Run bot
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          BIN_CHANNEL: ${{ secrets.BIN_CHANNEL }}
+          PLAYER_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
+          SECRET_KEY: ${{ secrets.SECRET_KEY }}
+          ALLOWED_USERS: ${{ secrets.ALLOWED_USERS }}
+          PORT: "8080"
+        run: python bot.py
