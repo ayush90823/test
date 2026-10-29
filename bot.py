@@ -16,10 +16,15 @@ import os
 import re
 
 from aiohttp import web
-from dotenv import load_dotenv
 from pyrogram import Client, filters, idle
 
-load_dotenv()
+# .env sirf local run ke liye; GitHub Actions me secrets seedha environment me aate hain
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
@@ -202,4 +207,6 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # asyncio.run() naya loop banata hai, jabki Client apne loop par bana hota hai
+    # ("attached to a different loop" error). Isliye client wala loop hi use karo.
+    bot.loop.run_until_complete(main())
