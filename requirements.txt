@@ -1,4 +1,4 @@
-pyTelegramBotAPI
-beautifulsoup4
-playwright
-playwright-stealth
+pyrogram==2.0.106
+tgcrypto
+aiohttp
+python-dotenv
